@@ -1,0 +1,760 @@
+---
+title: "Meta analysis of proportion of co-offenses"
+author: "Ruslan Klymentiev"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Set-up
+
+```{r warning=FALSE, message=FALSE}
+library(rstan)
+library(readxl)
+library(dplyr)
+library(bayesplot)
+library(brms)
+library(metafor)
+library(tidybayes)
+library(forcats)
+library(tidyverse)
+library(sjPlot)
+```
+
+```{r}
+df <- read_excel("../03_data_extraction/04_aggregated_data.xlsx", sheet = "cooffenses")
+df <- df %>% 
+  mutate(
+    total_number_offenses = round(total_number_offenses , 0),
+    total_number_cooffenses = round(total_number_cooffenses , 0)
+    ) %>% 
+  filter(
+    doi != "10.1080/07418825.2010.482535",  # duplicate 
+    Type != "All Youth"
+  ) %>% 
+  group_by(study_n, author, Type) %>% 
+  summarise(total_number_offenses = sum(total_number_offenses),
+            total_number_cooffenses = sum(total_number_cooffenses)) %>% 
+  mutate(prop = total_number_cooffenses / total_number_offenses)
+```
+
+# Fit
+
+## Weakly informative priors
+
+### Prior predictive check
+
+```{r}
+m_comb_prior <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author) + (1|Type),
+  prior = c(prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = sd)),
+  data = df,
+  family = binomial(link = "logit"),
+  sample_prior = "only",
+  seed = 111,
+  iter = 2000,
+  warmup = 500,
+  cores = 10,
+  chains = 4,
+  backend="rstan",
+  # refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 20,
+  file = "m_comb_prior")
+  )
+```
+
+```{r}
+mcmc_areas(m_comb_prior, regex_pars = c("Intercept"))
+```
+
+### Model
+
+```{r}
+m_comb <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author) + (1|Type),
+  prior = c(prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = sd)),
+  data = df,
+  family = binomial(link = "logit"),
+  seed = 222,
+  iter = 500,
+  warmup = 100,
+  cores = 20,
+  backend="rstan",
+  # refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 10)
+  )
+```
+
+### Posterior checks
+
+```{r}
+mcmc_trace(m_comb, regex_pars = c("b_Intercept", "sd"))
+```
+
+```{r}
+pp_check(m_comb, ndraws = 200) +
+  xlim(0, 200)
+
+# In the plot above, the dark line is the distribution of the observed outcomes y and each of the 50 lighter lines is the kernel density estimate of one of the replications of y from the posterior predictive distribution (i.e., one of the rows in yrep). 
+```
+
+### Summary
+
+```{r}
+summary(m_comb)
+```
+
+```{r}
+as_draws_df(m_comb) %>% 
+  select(starts_with("sd")) %>% 
+  gather(key, tau) %>% 
+  mutate(key = str_remove(key, "sd_") %>% str_remove(., "__Intercept")) %>% 
+  ggplot(aes(x = tau, fill = key)) +
+  geom_density(color = "transparent", alpha = 2/3) +
+  scale_fill_viridis_d(NULL) +
+  xlab(expression(tau)) +
+  ylab("Density") +
+  theme_minimal()
+```
+
+
+```{r}
+out_author <- spread_draws(m_comb, r_author[author,term], b_Intercept) %>% 
+  mutate(
+    b_Intercept = r_author + b_Intercept,
+    author = str_replace_all(author, "\\.", " "),
+    author = str_replace_all(author, "et al ", "et al."),
+    term = str_replace_all(term, "\\.", " "),
+    author = paste0(author, ",", term),
+    author = str_replace_all(author, ",0", ",")
+    )
+# extract draws for crime type RE
+out_type <- spread_draws(m_comb, r_Type[Type,term], b_Intercept) %>%
+  mutate(
+    b_Intercept = r_Type + b_Intercept,
+    author = Type)
+# extract grand average draws
+out_average <- spread_draws(m_comb, b_Intercept) %>% 
+  mutate(author = "Average")
+
+out_temp <-  bind_rows(out_type, out_average)
+
+out_all <- bind_rows(out_author, out_temp) %>% 
+  ungroup() %>%
+  arrange(author) %>% 
+  mutate(
+    author = fct_rev(author),
+    author = fct_relevel(author, c("Average", "All", "Other", "Violent", "Property"), after = 0),
+    b_Intercept = exp(b_Intercept),
+    b_Intercept = b_Intercept/(1+b_Intercept)
+    )
+
+out_all_sum <- group_by(out_all, author) %>% 
+  mean_qi(b_Intercept)
+grand_mean <- fixef(m_comb)[1]
+grand_mean <- exp(grand_mean) / (1+exp(grand_mean))
+
+grand_q <- fixef(m_comb)[1, 3:4]
+grand_q <- exp(grand_q) / (1 + exp(grand_q))
+
+out_all %>%   
+  ggplot(aes(b_Intercept, author)) +
+  geom_vline(xintercept = grand_mean, linewidth = 1, lty = 1, color = "grey") +
+  geom_vline(xintercept = grand_q, 
+             color = "grey", linetype = 2) +
+  stat_halfeye(.width = c(.8, .95), fill = "lightblue") +
+  geom_point(
+    data = df %>%
+      group_by(author) %>%
+      summarise(prop = mean(prop)),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_point(
+    data = df %>%
+      group_by(Type) %>%
+      summarise(prop = mean(prop)) %>% 
+      mutate(author = Type),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_point(
+    data = df %>%
+      ungroup() %>%
+      summarise(prop = mean(prop)) %>%
+      mutate(author = "Average"),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_text(
+    data = mutate_if(out_all_sum, is.numeric, round, 2),
+    aes(label = str_glue("{b_Intercept} [{.lower}, {.upper}]"), x = 1.25),
+    hjust = "inward"
+  ) +
+  labs(x = "Proportion",
+       y = NULL) +
+  theme_classic()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+df_nototal <- df %>% 
+  dplyr::filter(Type %in% c("Violent", "Property", "Other")) %>%
+  # dplyr::filter(type != "Total") %>% 
+  group_by(study_n, author, doi, Type) %>% 
+  # rename("Crime type" = Type) %>% 
+  summarise(total_number_offenses = sum(total_number_offenses),
+            total_number_cooffenses = sum(total_number_cooffenses)) %>% 
+  mutate(prop = total_number_cooffenses / total_number_offenses)
+
+df_total <- df %>% 
+  dplyr::filter(Type %in% c("Violent", "Property", "Other", "All")) %>%
+  group_by(study_n, author, doi) %>% 
+  summarise(total_number_offenses = sum(total_number_offenses),
+            total_number_cooffenses = sum(total_number_cooffenses)) %>% 
+  mutate(prop = total_number_cooffenses / total_number_offenses)
+```
+
+# Total
+
+## Weakly Informative Priors
+
+### Prior predictive check
+
+```{r}
+m_total_prior <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author),
+  prior = c(prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = sd)),
+  data = df_total,
+  family = binomial(link = "logit"),
+  sample_prior = "only",
+  seed = 11111,
+  iter = 2000,
+  warmup = 500,
+  cores = 10,
+  chains = 4,
+  backend="rstan",
+  refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 16)
+  )
+```
+
+```{r}
+mcmc_areas(m_total_prior, regex_pars = c("Intercept"))
+```
+
+### Fit
+
+```{r}
+m_total <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author),
+  prior = c(prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = sd)),
+  data = df_total,
+  family = binomial(link = "logit"),
+  seed = 123456,
+  iter = 5000,
+  warmup = 1000,
+  cores = 10,
+  chains = 4,
+  backend="rstan",
+  refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 16)
+  )
+```
+
+### Posterior check
+
+```{r}
+mcmc_trace(m_total, regex_pars = c("b_Intercept", "sd"))
+```
+
+```{r}
+summary(m_total)
+```
+
+```{r}
+m_total$fit
+```
+
+```{r}
+pp_check(m_total, type = "dens_overlay", nsamples = 200) +
+  xlim(0, 100)
+
+# In the plot above, the dark line is the distribution of the observed outcomes y and each of the 50 lighter lines is the kernel density estimate of one of the replications of y from the posterior predictive distribution (i.e., one of the rows in yrep). 
+```
+
+```{r}
+out_r <- spread_draws(m_total, r_author[author,term], b_Intercept) %>% 
+  mutate(b_Intercept = r_author + b_Intercept) %>% 
+  mutate(
+    author = str_replace_all(author, "\\.", " "),
+    author = str_replace_all(author, "et al ", "et al."),
+    term = str_replace_all(term, "\\.", " "),
+    author = paste0(author, ",", term))
+# Average effect
+out_f <- spread_draws(m_total, b_Intercept) %>% 
+  mutate(author = "Average")
+# out_t <- spread_draws(m, r_Type[Type,term], b_Intercept) %>% 
+#   mutate(b_Intercept = r_Type + b_Intercept) 
+# Combine average and study-specific effects' data frames
+out_all <- bind_rows(out_r, out_f) %>% 
+  ungroup() %>%
+  arrange(author) %>% 
+  mutate(author = fct_rev(author)) %>% 
+  # Ensure that Average effect is on the bottom of the forest plot
+  mutate(author = fct_relevel(author, "Average", after = 0)) %>% 
+  mutate(b_Intercept = exp(b_Intercept)) %>% 
+  mutate(b_Intercept = b_Intercept/(1+b_Intercept))
+  # dplyr::filter(b_Intercept < 10)
+# Data frame of summary numbers
+out_all_sum <- group_by(out_all, author) %>% 
+  mean_qi(b_Intercept)
+grand_mean <- fixef(m_total)[1]
+grand_mean <- exp(grand_mean) / (1+exp(grand_mean))
+grand_q <- fixef(m_total)[1, 3:4]
+grand_q <- exp(grand_q) / (1 + exp(grand_q))
+# Draw plot
+out_all %>%   
+  ggplot(aes(b_Intercept, author)) +
+  geom_vline(xintercept = grand_mean, linewidth = 1, lty = 1, color = "grey") +
+  geom_vline(xintercept = grand_q, 
+             color = "grey", linetype = 2) +
+  stat_halfeye(.width = c(.8, .95), fill = "white") +
+  geom_point(
+    data = df_total, 
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1 
+  ) +
+  geom_point(
+    data = df_total %>% 
+      ungroup() %>% 
+      summarise(prop = mean(prop)) %>% 
+      mutate(author = "Average"), 
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1 
+  ) +
+  geom_text(
+    data = mutate_if(out_all_sum, is.numeric, round, 2),
+    aes(label = str_glue("{b_Intercept} [{.lower}, {.upper}]"), x = 1.25),
+    hjust = "inward"
+  ) +
+  labs(x = "Proportion",
+       y = NULL) +
+  theme_classic()
+ggsave("02_bayes/forestplot_cooffenses_total.pdf", height = 18, units = "cm")
+```
+
+## Non-Informative Priors
+
+### Prior predictive check
+
+```{r}
+m_total_prior <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author),
+  prior = c(prior(normal(0, 1000), class = Intercept),
+            prior(uniform(0, 1000), class = sd)),
+  data = df_total,
+  family = binomial(link = "logit"),
+  sample_prior = "only",
+  seed = 11112,
+  iter = 2000,
+  warmup = 500,
+  cores = 10,
+  chains = 4,
+  backend="rstan",
+  refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 16)
+  )
+```
+
+```{r}
+mcmc_areas(m_total_prior, regex_pars = c("Intercept"))
+```
+
+### Fit
+
+```{r}
+m_total_ni <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author),
+  prior = c(prior(normal(0, 1000), class = Intercept),
+            prior(uniform(0, 1000), class = sd)),
+  data = df_total,
+  family = binomial(link = "logit"),
+  seed = 14587,
+  iter = 5000,
+  warmup = 1000,
+  cores = 10,
+  chains = 4,
+  backend="rstan",
+  refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 16)
+  )
+```
+
+### Posterior check
+
+```{r}
+mcmc_trace(m_total_ni, regex_pars = c("b_Intercept", "sd"))
+```
+
+```{r}
+summary(m_total_ni)
+```
+
+```{r}
+m_total_ni$fit
+```
+
+```{r}
+pp_check(m_total_ni, type = "dens_overlay", nsamples = 200) +
+  xlim(0, 100)
+
+
+```
+
+```{r}
+out_r <- spread_draws(m_total_ni, r_author[author,term], b_Intercept) %>% 
+  mutate(b_Intercept = r_author + b_Intercept) %>% 
+  mutate(
+    author = str_replace_all(author, "\\.", " "),
+    author = str_replace_all(author, "et al ", "et al."),
+    term = str_replace_all(term, "\\.", " "),
+    author = paste0(author, ",", term))
+# Average effect
+out_f <- spread_draws(m_total_ni, b_Intercept) %>% 
+  mutate(author = "Average")
+# out_t <- spread_draws(m, r_Type[Type,term], b_Intercept) %>% 
+#   mutate(b_Intercept = r_Type + b_Intercept) 
+# Combine average and study-specific effects' data frames
+out_all <- bind_rows(out_r, out_f) %>% 
+  ungroup() %>%
+  arrange(author) %>% 
+  mutate(author = fct_rev(author)) %>% 
+  # Ensure that Average effect is on the bottom of the forest plot
+  mutate(author = fct_relevel(author, "Average", after = 0)) %>% 
+  mutate(b_Intercept = exp(b_Intercept)) %>% 
+  mutate(b_Intercept = b_Intercept/(1+b_Intercept))
+  # dplyr::filter(b_Intercept < 10)
+# Data frame of summary numbers
+out_all_sum <- group_by(out_all, author) %>% 
+  mean_qi(b_Intercept)
+grand_mean <- fixef(m_total_ni)[1]
+grand_mean <- exp(grand_mean) / (1+exp(grand_mean))
+grand_q <- fixef(m_total_ni)[1, 3:4]
+grand_q <- exp(grand_q) / (1 + exp(grand_q))
+# Draw plot
+out_all %>%   
+  ggplot(aes(b_Intercept, author)) +
+  geom_vline(xintercept = grand_mean, linewidth = 1, lty = 1, color = "grey") +
+  geom_vline(xintercept = grand_q, 
+             color = "grey", linetype = 2) +
+  stat_halfeye(.width = c(.8, .95), fill = "white") +
+  geom_point(
+    data = df_total, 
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1 
+  ) +
+  geom_point(
+    data = df_total %>% 
+      ungroup() %>% 
+      summarise(prop = mean(prop)) %>% 
+      mutate(author = "Average"), 
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1 
+  ) +
+  geom_text(
+    data = mutate_if(out_all_sum, is.numeric, round, 2),
+    aes(label = str_glue("{b_Intercept} [{.lower}, {.upper}]"), x = 1.25),
+    hjust = "inward"
+  ) +
+  labs(x = "Proportion",
+       y = NULL) +
+  theme_classic()
+```
+
+# By crime type
+
+```{r}
+m_bytype <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author) + (1|Type),
+  prior = c(prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = sd)),
+  data = df_nototal,
+  family = binomial(link = "logit"),
+  seed = 78945,
+  iter = 5000,
+  warmup = 1000,
+  cores = 10,
+  backend="rstan",
+  # refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 20)
+  )
+```
+
+### Posterior check
+
+```{r}
+mcmc_trace(m_bytype, regex_pars = c("b_Intercept", "sd"))
+```
+
+```{r}
+summary(m_bytype)
+```
+
+```{r}
+m_bytype$fit
+```
+
+```{r}
+temp_df <- df_nototal %>% 
+  group_by(Type) %>% 
+  summarise(prop = mean(prop))
+
+out_t <- spread_draws(m_bytype, r_Type[Type,term], b_Intercept) %>% 
+    mutate(b_Intercept = b_Intercept + r_Type)
+out_i <- spread_draws(m_bytype, b_Intercept) %>% 
+  mutate(Type = "Average")
+out_all <- bind_rows(out_t, out_i) %>% 
+  ungroup() %>%
+  # Ensure that Average effect is on the bottom of the forest plot
+  mutate(author = fct_relevel(Type, "Average")) %>% 
+  mutate(b_Intercept = exp(b_Intercept)) %>% 
+  mutate(b_Intercept = b_Intercept/(1+b_Intercept))
+out_all_sum <- group_by(out_all, Type) %>% 
+  mean_qi(b_Intercept)
+grand_mean <- fixef(m_bytype)[1]
+grand_mean <- exp(grand_mean) / (1+exp(grand_mean))
+grand_q <- fixef(m_bytype)[1, 3:4]
+grand_q <- exp(grand_q) / (1 + exp(grand_q))
+out_all %>% 
+  ggplot(aes(b_Intercept, Type)) +
+  stat_halfeye(.width = c(.8, .95), fill = "lightblue") +
+  geom_vline(xintercept = grand_mean, linewidth = 1, lty = 1, color = "grey") +
+  geom_vline(xintercept = grand_q, 
+             color = "grey", linetype = 2) +
+  geom_point(
+    data = df_nototal %>% 
+      ungroup() %>% 
+      summarise(prop = mean(prop)) %>% 
+      mutate(Type = "Average"), 
+    aes(x=prop), position = position_nudge(y = -.1), shape = 1 
+  ) +
+  geom_point(
+    data = temp_df, 
+    aes(x=prop), position = position_nudge(y = -.1), shape = 1 
+  ) +
+  geom_text(
+    data = mutate_if(out_all_sum, is.numeric, round, 2),
+    aes(label = str_glue("{b_Intercept} [{.lower}, {.upper}]"), x = 1.25),
+    hjust = "inward"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+out_r <- spread_draws(m_bytype, r_author[author,term], b_Intercept) %>% 
+  mutate(b_Intercept = r_author + b_Intercept) %>% 
+  mutate(
+    author = str_replace_all(author, "\\.", " "),
+    author = str_replace_all(author, "et al ", "et al."),
+    term = str_replace_all(term, "\\.", " "),
+    author = paste0(author, ",", term),
+    author = str_replace_all(author, ",0", ",")
+    )
+# Average effect
+out_f <- spread_draws(m_bytype, b_Intercept) %>% 
+  mutate(author = "Average")
+# out_t <- spread_draws(m, r_Type[Type,term], b_Intercept) %>% 
+#   mutate(b_Intercept = r_Type + b_Intercept) 
+# Combine average and study-specific effects' data frames
+out_all <- bind_rows(out_r, out_f) %>% 
+  ungroup() %>%
+  arrange(author) %>% 
+  mutate(author = fct_rev(author)) %>% 
+  # Ensure that Average effect is on the bottom of the forest plot
+  mutate(author = fct_relevel(author, "Average", after = 0)) %>% 
+  mutate(b_Intercept = exp(b_Intercept)) %>% 
+  mutate(b_Intercept = b_Intercept/(1+b_Intercept))
+  # dplyr::filter(b_Intercept < 10)
+# Data frame of summary numbers
+out_all_sum <- group_by(out_all, author) %>% 
+  mean_qi(b_Intercept)
+grand_mean <- fixef(m_bytype)[1]
+grand_mean <- exp(grand_mean) / (1+exp(grand_mean))
+grand_q <- fixef(m_bytype)[1, 3:4]
+grand_q <- exp(grand_q) / (1 + exp(grand_q))
+# Draw plot
+out_all %>%   
+  ggplot(aes(b_Intercept, author)) +
+  geom_vline(xintercept = grand_mean, linewidth = 1, lty = 1, color = "grey") +
+  geom_vline(xintercept = grand_q, 
+             color = "grey", linetype = 2) +
+  stat_halfeye(.width = c(.8, .95), fill = "white") +
+  geom_point(
+    data = df_nototal %>% 
+      group_by(author) %>% 
+      summarise(prop = mean(prop)),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_point(
+    data = df_total %>% 
+      ungroup() %>% 
+      summarise(prop = mean(prop)) %>% 
+      mutate(author = "Average"), 
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1 
+  ) +
+  geom_text(
+    data = mutate_if(out_all_sum, is.numeric, round, 2),
+    aes(label = str_glue("{b_Intercept} [{.lower}, {.upper}]"), x = 1.25),
+    hjust = "inward"
+  ) +
+  labs(x = "Proportion",
+       y = NULL) +
+  theme_classic()
+```
+
+
+# All together
+
+```{r}
+m_comb <- brm(
+  total_number_cooffenses | trials(total_number_offenses) ~ 1 + (1|author) + (1|Type),
+  prior = c(prior(normal(0, 1), class = Intercept),
+            prior(normal(0, 1), class = sd)),
+  data = df,
+  family = binomial(link = "logit"),
+  seed = 12,
+  iter = 500,
+  warmup = 100,
+  cores = 20,
+  backend="rstan",
+  # refresh = 0,
+  control = list(
+    adapt_delta = 0.99, 
+    max_treedepth = 10)
+  )
+```
+
+
+
+```{r}
+pp_check(m_comb, ndraws = 200) +
+  xlim(0, 200)
+```
+
+```{r}
+as_draws_df(m_comb) %>% 
+  select(starts_with("sd")) %>% 
+  gather(key, tau) %>% 
+  mutate(key = str_remove(key, "sd_") %>% str_remove(., "__Intercept")) %>% 
+  ggplot(aes(x = tau, fill = key)) +
+  geom_density(color = "transparent", alpha = 2/3) +
+  scale_fill_viridis_d(NULL, end = .85) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  xlab(expression(tau)) +
+  theme(panel.grid = element_blank())
+```
+
+
+```{r}
+# extract draws for author RE
+out_author <- spread_draws(m_comb, r_author[author,term], b_Intercept) %>% 
+  mutate(
+    b_Intercept = r_author + b_Intercept,
+    author = str_replace_all(author, "\\.", " "),
+    author = str_replace_all(author, "et al ", "et al."),
+    term = str_replace_all(term, "\\.", " "),
+    author = paste0(author, ",", term),
+    author = str_replace_all(author, ",0", ",")
+    )
+# extract draws for crime type RE
+out_type <- spread_draws(m_comb, r_Type[Type,term], b_Intercept) %>%
+  mutate(
+    b_Intercept = r_Type + b_Intercept,
+    author = Type)
+# extract grand average draws
+out_average <- spread_draws(m_comb, b_Intercept) %>% 
+  mutate(author = "Average")
+
+out_temp <-  bind_rows(out_type, out_average)
+
+out_all <- bind_rows(out_author, out_temp) %>% 
+  ungroup() %>%
+  arrange(author) %>% 
+  mutate(
+    author = fct_rev(author),
+    author = fct_relevel(author, c("Average", "All", "Other", "Violent", "Property"), after = 0),
+    b_Intercept = exp(b_Intercept),
+    b_Intercept = b_Intercept/(1+b_Intercept)
+    )
+
+out_all_sum <- group_by(out_all, author) %>% 
+  mean_qi(b_Intercept)
+grand_mean <- fixef(m_comb)[1]
+grand_mean <- exp(grand_mean) / (1+exp(grand_mean))
+
+grand_q <- fixef(m_comb)[1, 3:4]
+grand_q <- exp(grand_q) / (1 + exp(grand_q))
+
+out_all %>%   
+  ggplot(aes(b_Intercept, author)) +
+  geom_vline(xintercept = grand_mean, linewidth = 1, lty = 1, color = "grey") +
+  geom_vline(xintercept = grand_q, 
+             color = "grey", linetype = 2) +
+  stat_halfeye(.width = c(.8, .95), fill = "lightblue") +
+  geom_point(
+    data = df %>%
+      group_by(author) %>%
+      summarise(prop = mean(prop)),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_point(
+    data = df %>%
+      group_by(Type) %>%
+      summarise(prop = mean(prop)) %>% 
+      mutate(author = Type),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_point(
+    data = df %>%
+      ungroup() %>%
+      summarise(prop = mean(prop)) %>%
+      mutate(author = "Average"),
+    aes(x=prop), position = position_nudge(y = -.2), shape = 1
+  ) +
+  geom_text(
+    data = mutate_if(out_all_sum, is.numeric, round, 2),
+    aes(label = str_glue("{b_Intercept} [{.lower}, {.upper}]"), x = 1.25),
+    hjust = "inward"
+  ) +
+  labs(x = "Proportion",
+       y = NULL) +
+  theme_classic()
+```
+
+
